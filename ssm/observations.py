@@ -970,9 +970,9 @@ class AutoRegressiveObservations(_AutoRegressiveObservationsBase):
                 Sigmas[k] = Sigmas[i]
 
         # Update parameters via their setter
-        self.As = As
-        self.Vs = Vs
-        self.bs = bs
+        # self.As = As
+        # self.Vs = Vs
+        # self.bs = bs
         self.Sigmas = Sigmas
 
     def sample_x(self, z, xhist, input=None, tag=None, with_noise=True):
