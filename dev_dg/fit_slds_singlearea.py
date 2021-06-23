@@ -1,3 +1,4 @@
+# %load fit_slds_singlearea.py
 import autograd.numpy as np
 import autograd.numpy.random as npr
 npr.seed(0)
@@ -8,43 +9,7 @@ sys.path.append(r"/Users/dikshagupta/python_transfer/pbups_phys/")
 from phys_helpers import *
 from physdata_preprocessing import *
 
-from scipy.ndimage import gaussian_filter1d
 
-
-    
-ratnames = ["X046", "X059", "X062", "X085"]
-regions = ["M2", "DMS"]
-
-for ratname in ratnames:
-    
-    p = dict()
-    p['ratname'] = ratname
-    
-    p['fr_thresh'] = 1.
-    p['align_to'] = 'cpoke_in'
-    p['post_mask'] = None
-    p['window'] = [0, 1500]
-    p['split_by'] = None
-    p['filter_type'] = None
-    p['filter_w'] = None
-    p['binsize'] = 25
-    p['nfolds'] = 10
-    
-    files = get_sortCells_for_rat(p['ratname'])
-    for f in range(len(files)):
-        p['filename'] = f
-        
-        for reg in regions:
-            p['region'] = region
-                
-                for K in range(4):
-                    p['K'] = K   # number of discrete states
-                    
-                    for D in range(8):
-                        p['D'] = D   # number of latent dimensions
-                        
-                        fit_slds(p)
-    
     
 def format_spikes(FR, ntrials):
     datas = []
@@ -62,6 +27,43 @@ def format_spikes(FR, ntrials):
     return datas
 
 
+def fit_slds_no_crossval(p):
+    
+    df_trial, df_cell, _ = load_phys_data_from_Cell(p['filename'])
+    y, inputs = load_data_for_slds(df_trial, df_cell, p)
+    
+
+    print("Fitting SLDS with Laplace-EM")
+    slds = ssm.SLDS(np.shape(y)[2], 
+                    p['K'], 
+                    p['D'], 
+                    M = inputs[0].shape[1], 
+                    emissions="poisson_orthog", 
+                    emission_kwargs={"bin_size":p['binsize']/1000, "link":"log"})
+
+    slds.initialize(y, inputs = inputs)
+
+    q_elbos, q = slds.fit(y, 
+                          inputs = inputs, 
+                          method="laplace_em",
+                          variational_posterior="structured_meanfield",
+                          num_iters=150, 
+                          initialize=True,
+                          num_init_restarts = 5,
+                          alpha=0.5)
+
+    choice = split_trials(df_trial, 'pokedR')
+    scores = compute_fit_score(slds, q, y, inputs, choice, p)
+
+    filename = p['filename'][:16] + "_sldsrun_K_" + str(p['K']) + "_D_" + str(p['D'])
+    save_object([q, slds], '/Users/dikshagupta/ondrive/analysisDG/PBups_Phys//saved_results/ssm_singlearea/' + filename + '.pkl')
+    summary = {'p' : p,
+               'score' : scores}
+    np.save('/Users/dikshagupta/ondrive/analysisDG/PBups_Phys/saved_results/ssm_singlearea/' + filename + '.npy' , summary) 
+  
+
+
+
 
 def fit_slds(p):
     
@@ -70,82 +72,88 @@ def fit_slds(p):
     
     from sklearn.model_selection import KFold
     kf = KFold(n_splits = p['nfolds'])
-    train_scores = np.empty(p['nfolds'])
-    test_scores = np.empty(p['nfolds'])
+    n_neurons = np.shape(y)[2]
+    train_scores = np.zeros((p['nfolds'], n_neurons))
+    test_scores = np.zeros((p['nfolds'], n_neurons))
     
     for train, test in kf.split(range(len(df_trial))):
         
         y_train = [y[train_id] for train_id in train]
         inputs_train = [inputs[train_id] for train_id in train]
+        
+        print(np.shape(y_train))
      
         print("Fitting SLDS with Laplace-EM")
-        slds = ssm.SLDS(len(df_cell), p['K'], p['D'], M = inputs[0].shape[1], 
+        slds = ssm.SLDS(np.shape(y)[2], p['K'], p['D'], M = inputs_train[0].shape[1], 
                         emissions="poisson_orthog", 
                         emission_kwargs={"bin_size":p['binsize']/1000, "link":"log"})
+        
         slds.initialize(y_train, inputs = inputs_train)
+        
         q_elbos, q = slds.fit(y_train, inputs = inputs_train, method="laplace_em",
                                       variational_posterior="structured_meanfield",
-                                      num_iters=50, 
+                                      num_iters=10, 
                                       initialize=True,
                                       num_init_restarts = 5,
                                       alpha=0.5)
         
         choice = split_trials(df_trial.loc[list(train)], 'pokedR')
-        train_scores[r] = compute_fit_score(q, y_train, inputs_train, choice, p)
+        train_scores[r] = compute_fit_score(slds, q, y_train, inputs_train, choice, p)
 
         y_test = [y[test_id] for test_id in test]
         inputs_test = [inputs[test_id] for test_id in test]
         choice = split_trials(df_trial.loc[list(test)], 'pokedR')
-        test_scores[r] = compute_fit_score(q, y_test, inputs_test, choice, p)
+        test_scores[r] = compute_fit_score(slds, q, y_test, inputs_test, choice, p)
+
+    filename = p['filename'][:16] + "_sldsrun_K_" + str(p['K']) + "_D_" + str(p['D'])
+    save_object(q, '/Users/dikshagupta/ondrive/analysisDG/PBups_Phys/saved_results/ssm_singlearea/' + filename + '.pkl')
+    summary = {'p' : p,
+               'train_score' : train_scores,
+               'test_score' : test_scores}
+    np.save('/Users/dikshagupta/ondrive/analysisDG/PBups_Phys/saved_results/ssm_singlearea/' + filename + '.npy' , summary) 
+  
+
 
         
-
-def compute_fit_score(q, ytrue, inp, p):
+def compute_fit_score(slds, q, ytrue, inp, choice, p):
+    
+    from scipy.ndimage import gaussian_filter1d
 
     ypred = []
+    print(len(ytrue))
     for tr in range(len(ytrue)):
         q_x = q.mean_continuous_states[tr]
         ypred.append(slds.smooth(q_x, ytrue[tr], input = inp[tr]))
-        
-        
-    
-    # get number of neurons
-    assert len(true_psths) == len(sim_psths)
-    N = len(true_psths)
 
-    r2 = np.zeros(N)
+    ytrue = np.array(ytrue)
+    ypred = np.array(ypred)
+    denom = p['binsize']*0.001
+    assert np.shape(ypred) == np.shape(ytrue)
 
-    for i in range(N):
+    n_neurons = np.shape(ytrue)[2]
+    r2 = np.zeros(n_neurons)
 
-        true_psth = true_psths[i]
-        sim_psth = sim_psths[i]
-        true_psth_mean = [true_psth[coh] for coh in range(len(true_psth)) if true_psth[coh].shape[0] > 0]
-        mean_PSTH = np.nanmean(np.vstack(true_psth_mean))
+    for i in range(n_neurons):
+
+        true_psth = [gaussian_filter1d(np.mean(ytrue[:,:,i][choice[ind]], axis = 0)/denom, 2) \
+                     for ind in list(choice)]
+        sim_psth = [np.mean(ypred[:,:,i][choice[ind]], 
+                            axis = 0)/denom for ind in list(choice)]
+        mean_PSTH = np.nanmean(np.vstack(true_psth))
 
         r2_num = 0.0
         r2_den = 0.0
 
-        # number of coherences, loop over
-        NC = len(true_psth)
-        for j in range(NC):
-            T = true_psth[j].shape[0]
-            if T > 0:
-                r2_num += np.nansum( (true_psth[j] - sim_psth[j][:T])**2)
-                r2_den += np.nansum( (mean_PSTH - true_psth[j])**2)
+        # loop over choices
+        for j in list(choice):
+            r2_num += np.nansum( (true_psth[j] - sim_psth[j])**2)
+            r2_den += np.nansum( (mean_PSTH - true_psth[j])**2)
 
         r2[i] = 1 - r2_num / r2_den
 
     return r2
 
-    
-    
-
-
-
-    
-    
-    
-    
+     
     
     
 def load_data_for_slds(df_trial, df_cell, p):
@@ -187,3 +195,45 @@ def load_data_for_slds(df_trial, df_cell, p):
         
     return y, inputs
 
+
+def save_object(obj, filename):
+    import pickle
+    with open(filename, 'wb') as output:  # Overwrites any existing file.
+        pickle.dump(obj, output, pickle.HIGHEST_PROTOCOL)
+        
+        
+        
+##############################        
+from sys import argv        
+        
+ratnames = ["X046", "X059", "X062", "X085"]
+regions = ["M2", "DMS"]
+
+    
+p = dict()
+p['ratname'] = ratnames[sys.argv[1] - 1]
+
+p['fr_thresh'] = 1.
+p['align_to'] = 'cpoke_in'
+p['post_mask'] = None
+p['window'] = [0, 1500]
+p['split_by'] = None
+p['filter_type'] = None
+p['filter_w'] = None
+p['binsize'] = 25
+p['nfolds'] = 10
+
+files = get_sortCells_for_rat(p['ratname'])
+for f in files:
+    p['filename'] = f
+
+    for reg in regions:
+        p['region'] = reg
+
+        for K in range(1,4):
+            p['K'] = K   # number of discrete states
+
+            for D in range(1,8):
+                p['D'] = D   # number of latent dimensions
+                fit_slds_no_crossval(p)
+    
